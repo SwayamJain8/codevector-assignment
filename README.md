@@ -1,17 +1,17 @@
-# CodeVector Take-Home — Product Catalog
+# CodeVector Assignment
 
-A small backend + frontend to browse **200,000 products** with fast, stable pagination.
+A backend + frontend product catalog to browse **200,000 products** with fast, stable pagination.
 
 **Live URLs**
 
-- API: `http://<your-ec2-ip>:3000`
-- UI: `https://<your-vercel-app>.vercel.app`
+- API: [https://codevector-assignment-api.swayamjain.me](https://codevector-assignment-api.swayamjain.me)
+- UI: [https://codevector-assignment.swayamjain.me](https://codevector-assignment.swayamjain.me)
 
 ---
 
 ## 1. The Problem
 
-The assignment asks us to build a product browser where:
+The assignment asks for a product browser where:
 
 - There are **~200,000 products** in the database
 - Users see products **newest first**
@@ -37,68 +37,79 @@ This has two problems:
 
 ---
 
-## 2. The Solution
+## 2. My Approach
 
 I used **cursor (keyset) pagination** instead of offset pagination.
 
-### How it works (simple version)
+### How it works
 
 1. Sort all products by **newest first**: `created_at DESC`, then `id DESC` as a tie-breaker
 2. Return the first 20 products
 3. Remember the **last product** on that page as a **bookmark (cursor)**
-4. For the next page, ask: _"Give me 20 products that come **after** this bookmark in our sort order"_
+4. For the next page, ask: *"Give me 20 products that come **after** this bookmark in our sort order"*
 5. The client sends the cursor back as `?cursor=...` in the next request
 
-The cursor is just the `createdAt` + `id` of the last item, encoded as base64.
+The cursor is the `createdAt` + `id` of the last item, encoded as base64url JSON in `[backend/src/lib/cursor.ts](backend/src/lib/cursor.ts)`.
 
 ### Why this solves the assignment
+
 
 | Problem                      | How cursor pagination fixes it                                                                                                                                                            |
 | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Slow deep pages              | No `OFFSET`. Database uses an **index** to jump directly to the right rows                                                                                                                |
 | Data changing while browsing | New products appear at the **top**. Your cursor points to an **older** position. Forward paging only looks at products **older than the cursor**, so new inserts don't shift your results |
 
+
 ### Tech choices
 
-| Part     | Choice                              | Why                               |
-| -------- | ----------------------------------- | --------------------------------- |
-| Runtime  | **Bun**                             | Fast, simple tooling              |
-| API      | **Express**                         | Lightweight, easy to explain      |
-| ORM      | **Prisma**                          | Type-safe queries, clean schema   |
-| Database | **PostgreSQL (Neon)**               | Strong indexing, free hosted tier |
-| Frontend | **Next.js + Shadcn**                | Simple UI to demo the API (bonus) |
-| Deploy   | **AWS EC2** (API) + **Vercel** (UI) | API on EC2, UI on Vercel          |
+
+| Part     | Choice                              | Why                                         |
+| -------- | ----------------------------------- | ------------------------------------------- |
+| Runtime  | **Bun**                             | Fast, simple tooling for API and scripts    |
+| API      | **Express**                         | Lightweight, easy to explain                |
+| ORM      | **Prisma 7** + **Neon adapter**     | Type-safe queries, serverless Postgres      |
+| Database | **PostgreSQL (Neon)**               | Strong indexing, free hosted tier           |
+| Frontend | **Next.js 16 + Shadcn**             | Simple UI to demo the API (bonus)           |
+| Deploy   | **AWS EC2** (API) + **Vercel** (UI) | API on EC2 with custom domain, UI on Vercel |
+
 
 ---
 
-## 3. Execution — How I Built It
+## 3. How I Built It
 
 ### Project structure
 
 ```
-codevector-assignment/
+codevector/
 ├── backend/
 │   ├── prisma/
-│   │   ├── schema.prisma      # table + indexes
-│   │   ├── seed.ts            # 200k product generator
-│   │   └── migrations/        # SQL to create tables
+│   │   └── schema.prisma           # table + composite indexes
+│   ├── scripts/
+│   │   └── seed.ts                 # 200k product generator
 │   ├── src/
-│   │   ├── index.ts           # Express server
-│   │   ├── routes/products.ts # main API logic
+│   │   ├── index.ts                # Express server + CORS
+│   │   ├── routes/
+│   │   │   └── products.route.ts   # route definitions
+│   │   ├── controllers/
+│   │   │   └── products.controller.ts  # pagination + category logic
 │   │   └── lib/
-│   │       ├── cursor.ts      # encode/decode pagination bookmark
-│   │       └── prisma.ts      # database connection
-│   └── deploy/
-│       └── products-api.service  # systemd unit for EC2
+│   │       ├── cursor.ts           # encode/decode pagination bookmark
+│   │       └── db.ts               # Prisma client (Neon adapter)
+│   └── prisma.config.ts
 └── frontend/
-    └── src/components/product-browser.tsx  # browse UI
+    └── src/
+        ├── app/                    # Next.js app router
+        ├── components/
+        │   └── product-browser.tsx # browse UI
+        └── lib/
+            └── api.ts              # API client
 ```
 
 ### Step 1 — Database schema
 
 Each product has: `id`, `name`, `category`, `price`, `created_at`, `updated_at`.
 
-Two indexes were added for speed:
+Two composite indexes for fast queries:
 
 ```prisma
 @@index([createdAt(sort: Desc), id(sort: Desc)])           // browse all, newest first
@@ -109,22 +120,24 @@ Without these, sorting 200k rows on every request would be slow.
 
 ### Step 2 — Seed script (200k products)
 
-File: [`backend/prisma/seed.ts`](backend/prisma/seed.ts)
+File: `[backend/scripts/seed.ts](backend/scripts/seed.ts)`
 
 - Inserts **200,000 products** in batches of **5,000** using bulk `INSERT` SQL
 - **Not** 200k separate `prisma.create()` calls (that would take forever)
-- Finishes in ~7 seconds locally, under ~30s on Neon
+- Truncates the table first, then inserts in **40 DB calls** instead of 200,000
 - Each product gets a unique `id`, staggered `created_at` (1 second apart) so "newest first" is meaningful
 
 ### Step 3 — API endpoints
 
+
 | Endpoint                       | Purpose                           |
 | ------------------------------ | --------------------------------- |
-| `GET /health`                  | Health check for EC2              |
+| `GET /health`                  | Health check                      |
 | `GET /api/products`            | Paginated product list            |
 | `GET /api/products/categories` | Category list for filter dropdown |
 
-**`GET /api/products` query params:**
+
+`**GET /api/products` query params:**
 
 - `limit` — items per page (default 20, max 100)
 - `category` — optional filter, e.g. `electronics`
@@ -140,12 +153,12 @@ File: [`backend/prisma/seed.ts`](backend/prisma/seed.ts)
 }
 ```
 
-Core query logic (simplified):
+Core query logic in `[backend/src/controllers/products.controller.ts](backend/src/controllers/products.controller.ts)`:
 
 ```typescript
 // First page: no cursor
 orderBy: [{ createdAt: "desc" }, { id: "desc" }];
-take: 21; // fetch 1 extra to know if there's a next page
+take: limit + 1; // fetch 1 extra to know if there's a next page
 
 // Next page: with cursor
 where: {
@@ -156,12 +169,17 @@ where: {
 }
 ```
 
+Categories are cached in memory after the first request to avoid repeated distinct queries.
+
 ### Step 4 — Frontend (bonus UI)
 
+File: `[frontend/src/components/product-browser.tsx](frontend/src/components/product-browser.tsx)`
+
+- Dark, minimal UI built with Shadcn components
 - Category dropdown filter
 - Toggle: **Pagination** (default) or **Continuous scroll**
 - Pagination: Previous / Next buttons, 20 items per page
-- Continuous scroll: auto-loads more when you reach the bottom
+- Continuous scroll: auto-loads more when you reach the bottom via `IntersectionObserver`
 
 ### Step 5 — Run locally
 
@@ -169,10 +187,10 @@ where: {
 
 ```bash
 cd backend
-cp .env.example .env        # set DATABASE_URL
+# set DATABASE_URL in .env (Neon pooled connection string)
 bun install
 bun run db:generate         # generate Prisma client from schema
-bun run db:migrate          # create tables in PostgreSQL
+bun run db:migrate          # apply migrations to PostgreSQL
 bun run seed                # insert 200k products
 bun run dev                 # start API on :3000
 ```
@@ -182,8 +200,8 @@ bun run dev                 # start API on :3000
 ```bash
 cd frontend
 cp .env.example .env.local  # set NEXT_PUBLIC_API_URL=http://localhost:3000
-npm install
-npm run dev                 # start UI on :3001
+bun install
+bun dev                     # start UI on :3001
 ```
 
 ---
@@ -219,7 +237,7 @@ This is the most important requirement.
 - New products push existing rows down
 - Page 2 might repeat products from page 1 or skip some
 
-**With cursor pagination (what we use):**
+**With cursor pagination (what I use):**
 
 - New products have a **newer** `created_at` → they appear at the **top** (page 1)
 - User's cursor points to an **older** position
@@ -231,6 +249,7 @@ This is the most important requirement.
 
 Each product has all required fields:
 
+
 | Field        | Type          |
 | ------------ | ------------- |
 | `id`         | UUID (unique) |
@@ -240,9 +259,10 @@ Each product has all required fields:
 | `created_at` | timestamp     |
 | `updated_at` | timestamp     |
 
+
 ### Condition 6: Seed script committed, fast approach
 
-- [`backend/prisma/seed.ts`](backend/prisma/seed.ts) is in the repo
+- `[backend/scripts/seed.ts](backend/scripts/seed.ts)` is in the repo
 - Uses bulk `INSERT` in batches of 5,000 — **40 DB calls** instead of 200,000
 
 ### Bonus: Simple UI
@@ -266,25 +286,24 @@ Each product has all required fields:
 2. Security group: open port **3000** (API) and **22** (SSH)
 3. Install Bun: `curl -fsSL https://bun.sh/install | bash`
 4. Clone repo, `cd backend`, `bun install`
-5. Set `.env`: `DATABASE_URL`, `PORT=3000`, `CORS_ORIGIN=<vercel-url>`
+5. Set `.env`:
+  - `DATABASE_URL` — Neon pooled connection string
+  - `PORT=3000`
+  - `CORS_ORIGIN=https://codevector-assignment.swayamjain.me`
 6. Run once: `bun run db:migrate && bun run seed`
-7. Start with systemd:
-
-```bash
-sudo cp deploy/products-api.service /etc/systemd/system/
-sudo systemctl enable --now products-api
-```
+7. Point `codevector-assignment-api.swayamjain.me` to the EC2 instance and run the API with `bun run start` (e.g. via systemd or a process manager)
 
 ### Frontend — Vercel
 
 1. Import repo, root directory: `frontend`
-2. Set `NEXT_PUBLIC_API_URL=http://<ec2-ip>:3000`
+2. Set `NEXT_PUBLIC_API_URL=https://codevector-assignment-api.swayamjain.me`
+3. Point `codevector-assignment.swayamjain.me` to the Vercel deployment
 
 ---
 
 ## How I Used AI
 
-I personally verified and understood: cursor pagination logic, index design, seed performance, and why offset pagination fails — these are the core parts I'd explain in the interview.
+I personally verified and understood: cursor pagination logic, index design, seed performance, and why offset pagination fails.
 
 ## Quick Stability Test
 
@@ -292,3 +311,4 @@ I personally verified and understood: cursor pagination logic, index design, see
 2. Insert 50 new products (re-run seed or add via script)
 3. Load page 2 using `nextCursor` from page 1
 4. Confirm: no duplicate IDs between pages, no gaps in the sequence
+
